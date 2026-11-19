@@ -6,8 +6,10 @@
 package badger
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/dustin/go-humanize"
@@ -244,6 +246,73 @@ func (sw *StreamWriter) Write(buf *z.Buffer) error {
 
 		sw.writers[streamId] = nil
 	}
+	return nil
+}
+
+// WriteEntries writes entries to the stream streamID at the given version. It
+// is Write for a caller that already holds its entries in memory: nothing is
+// serialized to a z.Buffer of pb.KV messages to be parsed again here, and
+// neither keys nor values are copied a second time.
+//
+// The keys must be in strictly increasing order, within a call and across the
+// calls made for the same stream, exactly as for Write. Entry.Key is the user
+// key, without a timestamp. UserMeta, ExpiresAt and the meta bits set through
+// Entry's With* methods are kept.
+//
+// The StreamWriter takes ownership of entries, including their Key and Value
+// slices: the caller must not read, modify or reuse them once WriteEntries has
+// been called. WriteEntries is thread safe; calls for different streams may be
+// made concurrently, and build their tables concurrently.
+func (sw *StreamWriter) WriteEntries(streamID uint32, version uint64, entries []*Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Tables hold keys with their timestamp appended. One allocation holds all
+	// of them for this call.
+	var size int
+	for _, e := range entries {
+		size += len(e.Key) + 8
+	}
+	keys := make([]byte, size)
+	for _, e := range entries {
+		n := copy(keys, e.Key)
+		binary.BigEndian.PutUint64(keys[n:], math.MaxUint64-version)
+		e.Key, keys = keys[:n+8:n+8], keys[n+8:]
+	}
+	req := &request{Entries: entries}
+
+	sw.writeLock.Lock()
+	if sw.maxVersion < version {
+		sw.maxVersion = version
+	}
+	if sw.prevLevel == 0 {
+		// Nothing has been written yet, so we can write to the last level. See Write.
+		sw.prevLevel = len(sw.db.lc.levels)
+	}
+	writer, ok := sw.writers[streamID]
+	if !ok {
+		var err error
+		if writer, err = sw.newWriter(streamID); err != nil {
+			sw.writeLock.Unlock()
+			return y.Wrapf(err, "failed to create writer with ID %d", streamID)
+		}
+		sw.writers[streamID] = writer
+	}
+	if writer == nil {
+		sw.writeLock.Unlock()
+		return fmt.Errorf("write performed on closed stream: %d", streamID)
+	}
+	// Values above the threshold go to the value log; it is not safe for concurrent writers.
+	err := sw.db.vlog.write([]*request{req})
+	sw.writeLock.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// Sent outside the lock, so that a stream waiting for its table builder
+	// does not hold up the others.
+	writer.reqCh <- req
 	return nil
 }
 

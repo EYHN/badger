@@ -12,7 +12,9 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -784,6 +786,206 @@ func TestStreamWriterIncremental(t *testing.T) {
 				require.Equal(t, "val3", string(val))
 				return nil
 			}))
+		})
+	})
+}
+
+// getSortedEntries returns listSize entries with the same keys as getSortedKVList.
+func getSortedEntries(valueSize, listSize int) []*Entry {
+	entries := make([]*Entry, 0, listSize)
+	for i := 0; i < listSize; i++ {
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, uint64(i))
+		value := make([]byte, valueSize)
+		y.Check2(rand.Read(value))
+		entries = append(entries, NewEntry(key, value))
+	}
+	return entries
+}
+
+// WriteEntries must leave the DB exactly as Write would have: every key readable at its
+// version, with its value, user meta and expiry, both below and above the value threshold.
+func TestStreamWriterEntries(t *testing.T) {
+	test := func(t *testing.T, opts *Options, valueSize int) {
+		runBadgerTest(t, opts, func(t *testing.T, db *DB) {
+			const noOfKeys = 1000
+			const batch = 64
+			entries := getSortedEntries(valueSize, noOfKeys)
+			expiresAt := uint64(time.Now().Add(time.Hour).Unix())
+			want := make([][]byte, noOfKeys)
+			for i, e := range entries {
+				want[i] = y.Copy(e.Value)
+				e.UserMeta = byte(i)
+				if i%2 == 0 {
+					e.ExpiresAt = expiresAt
+				}
+			}
+
+			sw := db.NewStreamWriter()
+			require.NoError(t, sw.Prepare(), "sw.Prepare() failed")
+			for len(entries) > 0 {
+				n := min(batch, len(entries))
+				require.NoError(t, sw.WriteEntries(1, 20, entries[:n]), "sw.WriteEntries() failed")
+				entries = entries[n:]
+			}
+			require.NoError(t, sw.Flush(), "sw.Flush() failed")
+			require.Equal(t, uint64(20), db.MaxVersion())
+
+			check := func(db *DB) {
+				require.NoError(t, db.View(func(txn *Txn) error {
+					it := txn.NewIterator(DefaultIteratorOptions)
+					defer it.Close()
+					i := 0
+					for it.Rewind(); it.Valid(); it.Next() {
+						item := it.Item()
+						require.Equal(t, uint64(i), binary.BigEndian.Uint64(item.Key()))
+						require.Equal(t, uint64(20), item.Version())
+						require.Equal(t, byte(i), item.UserMeta())
+						if i%2 == 0 {
+							require.Equal(t, expiresAt, item.ExpiresAt())
+						} else {
+							require.Zero(t, item.ExpiresAt())
+						}
+						val, err := item.ValueCopy(nil)
+						require.NoError(t, err)
+						require.Equal(t, want[i], val)
+						i++
+					}
+					require.Equal(t, noOfKeys, i)
+					return nil
+				}))
+			}
+			check(db)
+
+			if db.opt.InMemory {
+				return
+			}
+			// What went to the value log has to be found again by a DB opened later.
+			require.NoError(t, db.Close())
+			db2, err := Open(db.opt)
+			require.NoError(t, err)
+			check(db2)
+			// runBadgerTest closes db once more, which is a no-op.
+			require.NoError(t, db2.Close())
+		})
+	}
+	t.Run("values in the LSM tree", func(t *testing.T) {
+		test(t, nil, 128)
+	})
+	t.Run("values in the value log", func(t *testing.T) {
+		opts := DefaultOptions("").WithValueThreshold(1 << 10).WithLoggingLevel(WARNING)
+		test(t, &opts, 4<<10)
+	})
+	t.Run("in memory", func(t *testing.T) {
+		opts := DefaultOptions("").WithInMemory(true).WithLoggingLevel(WARNING)
+		test(t, &opts, 128)
+	})
+}
+
+// Streams written concurrently through WriteEntries each build their own tables, and a
+// stream closed through Write refuses further entries.
+func TestStreamWriterEntriesStreams(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		const streams = 8
+		const perStream = 5000
+		sw := db.NewStreamWriter()
+		require.NoError(t, sw.Prepare(), "sw.Prepare() failed")
+
+		var wg sync.WaitGroup
+		for s := 0; s < streams; s++ {
+			wg.Add(1)
+			go func(s int) {
+				defer wg.Done()
+				for i := 0; i < perStream; i += 500 {
+					entries := make([]*Entry, 0, 500)
+					for j := i; j < i+500; j++ {
+						key := []byte(fmt.Sprintf("%02d-%08d", s, j))
+						entries = append(entries, NewEntry(key, []byte(fmt.Sprintf("%d", j))))
+					}
+					require.NoError(t, sw.WriteEntries(uint32(s+1), 1, entries))
+				}
+			}(s)
+		}
+		wg.Wait()
+
+		// Close stream 1 the way the Stream framework does.
+		buf := z.NewBuffer(1<<10, "test")
+		defer func() { require.NoError(t, buf.Release()) }()
+		KVToBuffer(&pb.KV{StreamId: 1, StreamDone: true}, buf)
+		require.NoError(t, sw.Write(buf))
+		require.Error(t, sw.WriteEntries(1, 1, []*Entry{NewEntry([]byte("zz"), []byte("v"))}))
+
+		require.NoError(t, sw.Flush(), "sw.Flush() failed")
+
+		require.NoError(t, db.View(func(txn *Txn) error {
+			it := txn.NewIterator(DefaultIteratorOptions)
+			defer it.Close()
+			n := 0
+			for it.Rewind(); it.Valid(); it.Next() {
+				s, j := n/perStream, n%perStream
+				require.Equal(t, fmt.Sprintf("%02d-%08d", s, j), string(it.Item().Key()))
+				n++
+			}
+			require.Equal(t, streams*perStream, n)
+			return nil
+		}))
+	})
+}
+
+// BenchmarkStreamWriter loads the same sorted entries into an empty DB through Write and
+// through WriteEntries. Building the input is timed for both: it is the cost a caller pays.
+func BenchmarkStreamWriter(b *testing.B) {
+	const noOfKeys = 1 << 20
+	const batch = 20000
+	value := make([]byte, 64)
+	y.Check2(rand.Read(value))
+	key := func(i int) []byte {
+		k := make([]byte, 16)
+		binary.BigEndian.PutUint64(k[8:], uint64(i))
+		return k
+	}
+	run := func(b *testing.B, load func(sw *StreamWriter)) {
+		for n := 0; n < b.N; n++ {
+			b.StopTimer()
+			dir, err := os.MkdirTemp("", "badger-bench")
+			require.NoError(b, err)
+			db, err := Open(DefaultOptions(dir).WithLoggingLevel(WARNING))
+			require.NoError(b, err)
+			sw := db.NewStreamWriter()
+			require.NoError(b, sw.Prepare())
+			b.StartTimer()
+			load(sw)
+			require.NoError(b, sw.Flush())
+			b.StopTimer()
+			require.NoError(b, db.Close())
+			removeDir(dir)
+		}
+	}
+	b.Run("Write", func(b *testing.B) {
+		run(b, func(sw *StreamWriter) {
+			buf := z.NewBuffer(4<<20, "bench")
+			defer func() { require.NoError(b, buf.Release()) }()
+			for i := 0; i < noOfKeys; i++ {
+				KVToBuffer(&pb.KV{Key: key(i), Value: value, Version: 1}, buf)
+				if (i+1)%batch == 0 {
+					require.NoError(b, sw.Write(buf))
+					buf.Reset()
+				}
+			}
+			require.NoError(b, sw.Write(buf))
+		})
+	})
+	b.Run("WriteEntries", func(b *testing.B) {
+		run(b, func(sw *StreamWriter) {
+			entries := make([]*Entry, 0, batch)
+			for i := 0; i < noOfKeys; i++ {
+				entries = append(entries, NewEntry(key(i), value))
+				if len(entries) == batch {
+					require.NoError(b, sw.WriteEntries(1, 1, entries))
+					entries = make([]*Entry, 0, batch)
+				}
+			}
+			require.NoError(b, sw.WriteEntries(1, 1, entries))
 		})
 	})
 }
